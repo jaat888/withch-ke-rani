@@ -5554,6 +5554,15 @@ class _WorkerHandler(BaseHTTPRequestHandler):
 # No WORKER_URL, or worker down -> the web server falls back to doing it itself (RPC_FALLBACK=0 to forbid).
 _RPC_FUNCS = {}                     # name -> function (filled after the functions exist, see _install_rpc)
 _RPC_KEY = hashlib.sha256(_TK + b"|rpc").digest()
+# Cloady worker address.  The env WORKER_URL wins if it is set; otherwise this built-in address is used
+# (the worker is protected by the TOKEN_SECRET signature, so the address alone is not a secret).
+_WORKER_URL_DEFAULT = "https://cloude-anine-k-leya-b7rpy113-lunar-harbor.cloady.io"
+
+
+def _worker_url():
+    return ((os.environ.get("WORKER_URL") or "").strip() or _WORKER_URL_DEFAULT).rstrip("/")
+
+
 _rpc_state = {"fails": 0, "off_until": 0.0, "ok": 0, "fb": 0}
 
 
@@ -5569,7 +5578,7 @@ def _rpc_ok(body, ts, sig):
 
 
 def _rpc_call(name, args, timeout):
-    url = (os.environ.get("WORKER_URL") or "").strip().rstrip("/")
+    url = _worker_url()
     body = json.dumps({"args": args, "wnp": _wn_proxied(), "base": _public_base_holder.get("base")},
                       separators=(",", ":")).encode()
     ts = "%.0f" % time.time()
@@ -5608,7 +5617,11 @@ def _install_rpc():
     """web role + WORKER_URL set: meta / stream / skip are answered by the worker."""
     global handle_meta, handle_stream, api_skip
     _RPC_FUNCS.update(meta=handle_meta, stream=handle_stream, skip=api_skip)
-    if ROLE == "web" and (os.environ.get("WORKER_URL") or "").strip():
+    print("[env] WORKER_URL from panel: %s | in use: %s | SQL_URL %s | TOKEN_SECRET %s | ADMIN_KEY %s" % (
+        "set" if (os.environ.get("WORKER_URL") or "").strip() else "NOT set (built-in address used)", _worker_url(),
+        "set" if os.environ.get("SQL_URL") else "MISSING", "set" if os.environ.get("TOKEN_SECRET") else "MISSING",
+        "set" if os.environ.get("ADMIN_KEY") else "MISSING"), flush=True)
+    if ROLE == "web" and _worker_url():
         handle_meta = _rpc_wrap("meta", handle_meta, 20)
         handle_stream = _rpc_wrap("stream", handle_stream, 40)
         api_skip = _rpc_wrap("skip", api_skip, 20)
@@ -5616,7 +5629,7 @@ def _install_rpc():
 
         def _ping():
             time.sleep(15)
-            u = (os.environ.get("WORKER_URL") or "").strip().rstrip("/")
+            u = _worker_url()
             try:
                 with urllib.request.urlopen(u + "/health", timeout=20) as r:
                     print("[rpc] worker %s/health -> HTTP %s %s" % (u, r.status, r.read(40).decode("utf-8", "ignore")), flush=True)
