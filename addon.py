@@ -1404,9 +1404,13 @@ def _tmdb_lookup(name, is_movie, anime=True):
     mal, jf = None, 0
     if anime:
         try:
+            if time.time() < _JIKAN_DOWN["until"]:
+                raise RuntimeError("jikan paused (it timed out a moment ago)")
             mal = G.jikan_lookup(_tmdb_clean(name), is_movie)
         except Exception as e:
             jf = 1
+            if "imed out" in str(e) or "Timeout" in type(e).__name__ or "Timeout" in str(e):
+                _JIKAN_DOWN["until"] = time.time() + 600         # api.jikan.moe not reachable: don't wait 12 s on every show
             applog.log_once("jikan-" + type(e).__name__, 600, "error", "jikan",
                             f"jikan lookup failed (e.g. '{name}'): {str(e)[-160:]}  - same error is hidden for 10 min")
     if not results and not mal:
@@ -1435,6 +1439,9 @@ def _tmdb_fresh(hit):
     if hit.get("jf"):                     # Jikan was down: try again soon
         ttl = min(ttl, JIKAN_RETRY_TTL)
     return time.time() - hit.get("t", 0) < ttl
+
+
+_JIKAN_DOWN = {"until": 0.0}
 
 
 def _tmdb_refresh(rec):
@@ -5458,7 +5465,7 @@ def _pull_loop():
             beat = json.loads(accounts.kv_get("w_beat") or "null") or {}
             age = time.time() - float(beat.get("t") or 0)
             print("[pull] checked the worker's data: %s | worker last seen %s ago" % (
-                "took in news" if changed else "nothing new", ("%d min" % (age // 60)) if beat else "NEVER (is Cloady running?)"), flush=True)
+                "took in news" if changed else "nothing new", ("%d min" % (age // 60)) if beat else "NEVER (Cloady not running, or its SQL_URL differs from this one)"), flush=True)
         except Exception as e:
             print("[pull] failed:", repr(e)[:150], flush=True)
         time.sleep(gap)
@@ -5477,6 +5484,8 @@ def _beat_loop():
             _kv_put("w_beat", json.dumps({"t": time.time(), "shows": _WSTAT["shows"], "rss": _WSTAT["rss_mb"]}))
         except Exception as e:
             print("[beat] failed:", repr(e)[:120], flush=True)
+            time.sleep(30)
+            continue
         time.sleep(gap)
 
 
@@ -5605,6 +5614,19 @@ def _install_rpc():
         api_skip = _rpc_wrap("skip", api_skip, 20)
         print("[rpc] meta / stream / skip are done by the worker (URL hidden from users)", flush=True)
 
+        def _ping():
+            time.sleep(15)
+            u = (os.environ.get("WORKER_URL") or "").strip().rstrip("/")
+            try:
+                with urllib.request.urlopen(u + "/health", timeout=20) as r:
+                    print("[rpc] worker %s/health -> HTTP %s %s" % (u, r.status, r.read(40).decode("utf-8", "ignore")), flush=True)
+            except Exception as e:
+                print("[rpc] WORKER NOT REACHABLE: %s -> %r  (check WORKER_URL, and that Cloady is running)" % (u, e), flush=True)
+        threading.Thread(target=_ping, daemon=True).start()
+    elif ROLE == "web":
+        print("[rpc] WORKER_URL is NOT SET -> this server does meta / stream / skip ITSELF (this is the big CPU use). "
+              "Set WORKER_URL=https://<cloady url> in the Wispbyte env.", flush=True)
+
 
 def _boot_from_db():
     """Everything the last run saved: catalog, AniList, trending lists."""
@@ -5686,6 +5708,41 @@ _LOW = (_lc in ("1", "on", "yes", "true")) if _lc else (False if ROLE == "worker
 CPU_TARGET = float(os.environ.get("CPU_TARGET") or (40 if ROLE == "worker" else 12))   # % of one core, averaged over ~2 minutes (worker host = 0.5 vCPU)
 _cpu_hot = threading.Event()
 _cpu_now = {"pct": 0.0}
+
+# The host panel (Wispbyte) shows MORE CPU than this process measures (pip/git/imports, helper threads, its own
+# accounting).  Seen on the real host: our 12 ~= panel 20.  CPU_SCALE (default 1.67 = 20/12) multiplies what the
+# governor / cpu-watch see, so "target 12" means 12 on the PANEL.  CPU_SOURCE=cgroup uses the container's own
+# counter instead (exactly what a panel shows) - turn it on once the [use] line's "container" % matches the panel.
+CPU_SCALE = float(os.environ.get("CPU_SCALE") or 1.67)
+_CPU_SRC = (os.environ.get("CPU_SOURCE") or "process").strip().lower()
+
+
+def _cg_secs():
+    """CPU seconds used by this whole container (cgroup v2 / v1), or None."""
+    try:
+        with open("/sys/fs/cgroup/cpu.stat") as f:
+            for ln in f:
+                if ln.startswith("usage_usec"):
+                    return int(ln.split()[1]) / 1e6
+    except Exception:
+        pass
+    for pth in ("/sys/fs/cgroup/cpuacct/cpuacct.usage", "/sys/fs/cgroup/cpu,cpuacct/cpuacct.usage",
+                "/sys/fs/cgroup/cpu/cpuacct.usage"):
+        try:
+            with open(pth) as f:
+                return int(f.read().strip()) / 1e9
+        except Exception:
+            pass
+    return None
+
+
+def _cpu_secs():
+    """CPU seconds in PANEL units - what the governor and cpu-watch use."""
+    if _CPU_SRC == "cgroup":
+        v = _cg_secs()
+        if v is not None:
+            return v
+    return time.process_time() * CPU_SCALE
 
 
 # ------------------------------------------------------------ starting screen ---
@@ -5786,8 +5843,25 @@ def _install_meter():
                 pass
     Handler._route = metered
 
+    def _thr_cpu():
+        out = {}
+        try:
+            tick = os.sysconf("SC_CLK_TCK")
+            names = {t.native_id: t.name for t in threading.enumerate()}
+            for tid in os.listdir("/proc/self/task"):
+                try:
+                    with open("/proc/self/task/%s/stat" % tid) as f:
+                        rest = f.read().rsplit(")", 1)[1].split()
+                    out[int(tid)] = ((int(rest[11]) + int(rest[12])) / float(tick), names.get(int(tid), "native/curl"))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return out
+
     def _report():
         last_p, last_w = time.process_time(), time.time()
+        last_t, last_cg = _thr_cpu(), _cg_secs()
         while True:
             time.sleep(60)
             try:
@@ -5805,8 +5879,17 @@ def _install_meter():
                     parts.append("%s %d req %dMB cpu %.1fs" % (k, n, b // 1048576, c))
                 gv = _GOV
                 gtxt = ("%d KB/s" % (gv.rate // 1024) if gv.rate > 0 else "none") if gv else "off"
-                print("[use] 60s | %s | process cpu %.1fs (%.0f%%) | speed limit %s | rpc ok=%d fallback=%d" % (
-                    " | ".join(parts) or "no requests", pcpu, pct, gtxt, _rpc_state["ok"], _rpc_state["fb"]), flush=True)
+                cg = _cg_secs()
+                ctxt = (" | container %.0f%%" % (100.0 * (cg - last_cg) / max(1.0, w - last_w))) if (cg is not None and last_cg is not None) else ""
+                last_cg = cg
+                print("[use] 60s | %s | process cpu %.1fs (%.0f%%, panel-equiv %.0f%%)%s | speed limit %s | rpc ok=%d fallback=%d" % (
+                    " | ".join(parts) or "no requests", pcpu, pct, pct * CPU_SCALE, ctxt, gtxt, _rpc_state["ok"], _rpc_state["fb"]), flush=True)
+                cur = _thr_cpu()
+                top = sorted(((v[0] - last_t.get(k, (0, ""))[0], v[1]) for k, v in cur.items()), reverse=True)[:4]
+                top = ["%s %.1fs" % (n, d) for d, n in top if d >= 0.3]
+                if top:
+                    print("[use] busiest threads: " + " | ".join(top), flush=True)
+                last_t = cur
             except Exception:
                 pass
     threading.Thread(target=_report, daemon=True, name="use-meter").start()
@@ -5835,6 +5918,7 @@ class _StreamGov:
         self.hist = []                 # (monotonic, cpu seconds, bytes sent)
         self.a30 = 0.0
         self.a180 = 0.0
+        self.hot = False               # CPU over target (video is NOT the only thing that burns CPU)
 
     def take(self, n, w=1):
         """Called before every video chunk is written; sleeps when the shared speed limit is used up."""
@@ -5891,6 +5975,7 @@ class _StreamGov:
                     self.cpu_rate *= 1.1
                     if self.cpu_rate > 64 * 1048576:
                         self.cpu_rate = 0.0
+            self.hot = bool((a30 is not None and a30 > self.T) or (a180 is not None and a180 > self.T * 0.95))
             r = self.cpu_rate
             if self.cap > 0:
                 r = min(r, self.cap) if r > 0 else self.cap
@@ -5909,7 +5994,7 @@ def _install_gov():
     if v in ("0", "off", "no", "false") or (not _LOW and v not in ("1", "on", "yes", "true")):
         return
     target = float(os.environ.get("CPU_STREAM_MAX") or (CPU_TARGET * 0.85))
-    _GOV = _StreamGov(target, _env_int("GOV_MIN_KBPS", 400) * 1024, _env_int("BW_MAX_KBPS", 0) * 1024)
+    _GOV = _StreamGov(target, _env_int("GOV_MIN_KBPS", 250) * 1024, _env_int("BW_MAX_KBPS", 0) * 1024)
     print("[gov] stream CPU governor ON: CPU target %.1f%% (30 s and 3 min average), lowest speed %d KB/s%s" % (
         target, _GOV.MIN // 1024, (", fixed cap %d KB/s" % (_GOV.cap // 1024)) if _GOV.cap else ""), flush=True)
 
@@ -5919,7 +6004,7 @@ def _install_gov():
             time.sleep(3)
             try:
                 g = _GOV
-                r = g.step(time.monotonic(), time.process_time())
+                r = g.step(time.monotonic(), _cpu_secs())
                 state = int(r // 1024) if r > 0 else 0
                 if last is None or (state == 0) != (last == 0) or (state and last and abs(state - last) > 0.3 * last):
                     print("[gov] cpu30=%.0f%% cpu3min=%.0f%% -> video speed limit: %s" % (
@@ -5930,6 +6015,37 @@ def _install_gov():
     threading.Thread(target=_loop, daemon=True, name="stream-gov").start()
 
 
+_HEAVY_SEM = threading.Semaphore(2)
+
+
+def _install_gate():
+    """While the CPU is over target, the NON-video heavy routes (skip / watch / meta / img) go through a
+    2-lane queue with a short pause, so the burst is spread out instead of stacking up.  Video is already
+    slowed by the speed limit.  Cheap routes (home, heartbeat, pages) are never delayed."""
+    if ROLE != "web" or _GOV is None:
+        return
+    orig = Handler._route
+
+    def gated(self):
+        got = False
+        try:
+            g = _GOV
+            if g is not None and g.hot:
+                try:
+                    cls = _use_class(unquote(urlparse(self.path).path))
+                except Exception:
+                    cls = ""
+                if cls in ("skip", "watch", "meta", "img"):
+                    got = _HEAVY_SEM.acquire(timeout=20)
+                    time.sleep(0.25)
+            return orig(self)
+        finally:
+            if got:
+                _HEAVY_SEM.release()
+    Handler._route = gated
+    print("[gov] heavy-route gate ON (skip/watch/meta/img wait in a 2-lane queue while CPU is over target)", flush=True)
+
+
 def _bg_wait(limit=600):
     """Background loops call this between jobs: it waits while the app is using too much CPU."""
     t0 = time.time()
@@ -5938,11 +6054,11 @@ def _bg_wait(limit=600):
 
 
 def _cpu_watch():
-    last_c, last_w, avg, n = time.process_time(), time.time(), 0.0, 0
+    last_c, last_w, avg, n = _cpu_secs(), time.time(), 0.0, 0
     while True:
         time.sleep(4)
         try:
-            c, w = time.process_time(), time.time()
+            c, w = _cpu_secs(), time.time()
             pct = 100.0 * (c - last_c) / max(0.001, w - last_w)
             last_c, last_w = c, w
             avg = pct if n == 0 else avg * 0.5 + pct * 0.5           # reacts within ~10 s: no long 100% burst
@@ -6010,15 +6126,16 @@ def _startup_work():
         print(f"[worker] background worker (CPU target {CPU_TARGET:.0f}% of one core)", flush=True)
         threading.Thread(target=_restore_from_db, daemon=True).start()
         threading.Thread(target=_tmdb_boot, daemon=True).start()
+        threading.Thread(target=_beat_loop, daemon=True).start()     # "worker last seen" shows up at once
         _DB_READY.wait(300)
-        for fn in (_hourly_sync, _catalog_refresh, _fresh_watch, _tmdb_backfill, _beat_loop):
+        for fn in (_hourly_sync, _catalog_refresh, _fresh_watch, _tmdb_backfill):
             threading.Thread(target=fn, daemon=True).start()
             time.sleep(5)
         return
     threading.Thread(target=shows_payload, daemon=True).start()   # build the home page list right now, not after the DB wait
     threading.Thread(target=_mem_watch, daemon=True).start()
     if _LOW:
-        print(f"[cpu] low-CPU mode ON (target {CPU_TARGET:.0f}% of one core)", flush=True)
+        print(f"[cpu] low-CPU mode ON (target {CPU_TARGET:.0f}% in PANEL units; measured x{CPU_SCALE:g}, source={_CPU_SRC})", flush=True)
         threading.Thread(target=_cpu_watch, daemon=True, name="cpu-watch").start()
     threading.Thread(target=_restore_from_db, daemon=True).start()
     if _LOW:
@@ -6143,6 +6260,7 @@ def main():
     _install_rpc()
     _install_meter()
     _install_gov()
+    _install_gate()
     if ROLE == "worker":
         threading.Thread(target=_startup, daemon=True).start()
         srv = ThreadingHTTPServer(("0.0.0.0", port), _WorkerHandler)
