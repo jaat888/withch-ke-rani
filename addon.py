@@ -488,13 +488,16 @@ def _cf_blocked(text):
     return "just a moment" in t or "cf-chl" in t or "attention required! | cloudflare" in t
 
 
-def upstream_stream(url, referer=None, rng=None, timeout=30):
-    """Streaming variant for /mq child proxying."""
+def upstream_stream(url, referer=None, rng=None, timeout=30, sess=None):
+    """Streaming variant for /mq child proxying.  sess = an open creq.Session: its connection is
+    reused (no new TLS handshake per call) - used by downloads, which fetch hundreds of segments."""
     headers = {"User-Agent": UA, "Accept": "*/*"}
     if referer:
         headers["Referer"] = referer
     if rng:
         headers["Range"] = rng
+    if sess is not None:
+        return sess.get(url, headers=headers, timeout=timeout, stream=True, allow_redirects=True)
     return creq.get(url, headers=headers, timeout=timeout, stream=True,
                     allow_redirects=True, impersonate="chrome")
 
@@ -3560,6 +3563,16 @@ _HTML_HEADS = (b"<!DO", b"<htm")
 def _out(handler, chunk):
     """handler.wfile.write(chunk) - but a visitor in the slow-down (guard.bot_strike) gets SLOW_BPS bytes/second."""
     try:
+        handler._ub = getattr(handler, "_ub", 0) + len(chunk)     # usage meter: bytes sent by this request
+    except Exception:
+        pass
+    g = _GOV
+    if g is not None:
+        try:
+            g.take(len(chunk), 3 if getattr(handler, "_dl", False) else 1)   # shared CPU speed limit (a download counts 3x)
+        except Exception:
+            pass
+    try:
         slow = (not getattr(handler, "_vip", None)) and guard.is_slow(getattr(handler, "_ip", ""), getattr(handler, "_dev", ""))
     except Exception:
         slow = False
@@ -3827,6 +3840,7 @@ def _serve_download(handler, zipper, b64url, name, check=False):
     if not target.startswith("http"):
         handler._send({"error": "bad link"}, 400)
         return
+    dsess = None
     try:
         r = upstream_get(target, referer=ARGON, timeout=20)
         if r.status_code != 200:
@@ -3863,6 +3877,7 @@ def _serve_download(handler, zipper, b64url, name, check=False):
         if check:
             handler._send({"ok": True, "parts": len(items)})
             return
+        handler._dl = True                  # downloads get a smaller share of the speed limit than players
         ext = ".mp4" if init else ".ts"
         safe = re.sub(r"[^\w\- ]+", "", name or "video").strip().replace(" ", "_")[:80] or "video"
         handler.send_response(200)
@@ -3874,13 +3889,18 @@ def _serve_download(handler, zipper, b64url, name, check=False):
         handler.close_connection = True
         if handler._is_head:
             return
+        try:
+            dsess = creq.Session(impersonate="chrome")      # ONE connection for all segments (was: a new TLS handshake each)
+        except Exception:
+            dsess = None
         for url, rngt in items:
             ok = False
             for attempt in range(3):
                 up = None
                 try:
                     rng = f"bytes={rngt[0]}-{rngt[1]}" if rngt else None
-                    up = upstream_stream(url, referer=ARGON, rng=rng, timeout=30)
+                    up = upstream_stream(url, referer=ARGON, rng=rng, timeout=30,
+                                         sess=dsess if attempt == 0 else None)   # a retry always uses a fresh connection
                     if up.status_code not in (200, 206):
                         raise RuntimeError(f"seg {up.status_code}")
                     length = skip = None
@@ -3909,6 +3929,12 @@ def _serve_download(handler, zipper, b64url, name, check=False):
     except Exception as exc:
         try:
             handler._send({"error": f"download: {exc}"}, 502)
+        except Exception:
+            pass
+    finally:
+        try:
+            if dsess is not None:
+                dsess.close()
         except Exception:
             pass
 
@@ -5713,6 +5739,197 @@ tick();
 </script></body></html>"""
 
 
+# ------------------------------------------------------------- usage meter ---
+# Shows WHERE the CPU goes.  Every 60 s (while visitors are active) one line is printed:
+#   [use] 60s | mq 14 req 38MB cpu 2.1s | img 30 req 0MB cpu 0.4s | ... | process cpu 6.0s (10%) | rpc ok=3 fallback=0
+# "cpu" of a route = CPU time of the threads that served it.  "process cpu" = everything (also the
+# curl/TLS helper threads and background jobs); if it is much bigger than the sum, the rest is
+# TLS / network helper work or background jobs.  USE_METER=0 turns it off.
+_USE = {}
+_USE_LOCK = threading.Lock()
+
+
+def _use_class(path):
+    p = path or ""
+    for pre, name in (("/mq/", "mq"), ("/wn/", "wn"), ("/img/", "img"), ("/api/watch", "watch"),
+                      ("/api/skip", "skip"), ("/stream/", "stream"), ("/meta/", "meta"), ("/api/", "api")):
+        if p.startswith(pre):
+            return name
+    return "page"
+
+
+def _use_add(cls, cpu, nbytes):
+    with _USE_LOCK:
+        r = _USE.setdefault(cls, [0, 0.0, 0])
+        r[0] += 1
+        r[1] += cpu
+        r[2] += nbytes
+
+
+def _install_meter():
+    if (os.environ.get("USE_METER") or "1").strip().lower() in ("0", "off", "no", "false"):
+        return
+    if ROLE == "worker":
+        return
+    orig = Handler._route
+
+    def metered(self):
+        self._ub = 0
+        self._dl = False
+        t0 = time.thread_time()
+        try:
+            return orig(self)
+        finally:
+            try:
+                _use_add(_use_class(unquote(urlparse(self.path).path)), time.thread_time() - t0, self._ub)
+            except Exception:
+                pass
+    Handler._route = metered
+
+    def _report():
+        last_p, last_w = time.process_time(), time.time()
+        while True:
+            time.sleep(60)
+            try:
+                with _USE_LOCK:
+                    snap = {k: list(v) for k, v in _USE.items()}
+                    _USE.clear()
+                p, w = time.process_time(), time.time()
+                pct = 100.0 * (p - last_p) / max(1.0, w - last_w)
+                pcpu = p - last_p
+                last_p, last_w = p, w
+                if not snap and pct < 3:
+                    continue
+                parts = []
+                for k, (n, c, b) in sorted(snap.items(), key=lambda kv: -kv[1][1]):
+                    parts.append("%s %d req %dMB cpu %.1fs" % (k, n, b // 1048576, c))
+                gv = _GOV
+                gtxt = ("%d KB/s" % (gv.rate // 1024) if gv.rate > 0 else "none") if gv else "off"
+                print("[use] 60s | %s | process cpu %.1fs (%.0f%%) | speed limit %s | rpc ok=%d fallback=%d" % (
+                    " | ".join(parts) or "no requests", pcpu, pct, gtxt, _rpc_state["ok"], _rpc_state["fb"]), flush=True)
+            except Exception:
+                pass
+    threading.Thread(target=_report, daemon=True, name="use-meter").start()
+
+
+# ------------------------------------------------------- stream CPU governor ---
+# A free panel host (Wispbyte) stops the server when its CPU average stays above ~12%.  The video bytes
+# (stream / download) are what burn the CPU, so THIS is the brake: all video bytes of all visitors share ONE
+# speed limit that a controller keeps adjusting so the CPU average (last 30 s AND last 3 min) stays under
+# the target.  Quiet server = no limit at all.  Busy server = everybody gets a smaller, fair share and a
+# download gets less than a stream (a player is never starved by a download).  Visitors just see a slightly
+# slower buffer, never an error.   STREAM_GOV=0 turns it off, CPU_STREAM_MAX = target % (default 85% of CPU_TARGET),
+# GOV_MIN_KBPS = lowest total speed (default 400 KB/s), BW_MAX_KBPS = optional fixed cap on total video speed.
+class _StreamGov:
+    def __init__(self, target, min_bps, cap_bps=0):
+        self.T = float(target)
+        self.MIN = float(min_bps)
+        self.cap = float(cap_bps)
+        self.lock = threading.Lock()
+        self.cpu_rate = 0.0            # 0 = no CPU limit right now
+        self.rate = self.cap           # effective total bytes/s (0 = unlimited)
+        self.tokens = 0.0
+        self.t = time.monotonic()
+        self.sent = 0
+        self.last_play = 0.0
+        self.hist = []                 # (monotonic, cpu seconds, bytes sent)
+        self.a30 = 0.0
+        self.a180 = 0.0
+
+    def take(self, n, w=1):
+        """Called before every video chunk is written; sleeps when the shared speed limit is used up."""
+        with self.lock:
+            self.sent += n
+            r = self.rate
+            if r <= 0:
+                return
+            now = time.monotonic()
+            self.tokens = min(self.tokens + (now - self.t) * r, max(r * 0.5, 262144.0))
+            self.t = now
+            self.tokens -= n
+            wait = -self.tokens / r if self.tokens < 0 else 0.0
+            if w > 1:
+                if now - self.last_play < 3.0:     # players are watching: a download waits extra turns (smaller share)
+                    wait += n * (w - 1) / r
+            else:
+                self.last_play = now
+        if wait > 0.001:
+            time.sleep(min(wait, 5.0))
+
+    def _pct(self, now, cpu, win, minspan=10):
+        base = None
+        for h in self.hist:
+            if now - h[0] <= win:
+                base = h
+                break
+        if base is None or now - base[0] < minspan:
+            return None, 0.0
+        span = now - base[0]
+        return 100.0 * (cpu - base[1]) / span, (self.sent - base[2]) / span
+
+    def step(self, now, cpu):
+        """One controller step (every ~3 s).  Returns the new effective rate."""
+        with self.lock:
+            self.hist.append((now, cpu, self.sent))
+            while len(self.hist) > 2 and now - self.hist[0][0] > 200:
+                self.hist.pop(0)
+            a10, obs10 = self._pct(now, cpu, 10, 6)
+            a30, obs = self._pct(now, cpu, 30)
+            a180, _ = self._pct(now, cpu, 180)
+            self.a30 = a30 or 0.0
+            self.a180 = a180 or 0.0
+            if a10 is not None and a10 > self.T * 1.6:           # sudden burst: brake at once
+                base = min(self.cpu_rate, max(obs10, self.MIN)) if self.cpu_rate > 0 else max(obs10, self.MIN)
+                self.cpu_rate = max(self.MIN, base * 0.6)
+            elif a30 is not None:
+                over = a30 > self.T * 1.1 or (a180 is not None and a180 > self.T)
+                calm = a30 < self.T * 0.75 and (a180 is None or a180 < self.T * 0.9)
+                if over:
+                    base = min(self.cpu_rate, max(obs, self.MIN)) if self.cpu_rate > 0 else max(obs, self.MIN)
+                    self.cpu_rate = max(self.MIN, base * (0.6 if (a180 is not None and a180 > self.T * 1.15) else 0.75))
+                elif calm and self.cpu_rate > 0:
+                    self.cpu_rate *= 1.1
+                    if self.cpu_rate > 64 * 1048576:
+                        self.cpu_rate = 0.0
+            r = self.cpu_rate
+            if self.cap > 0:
+                r = min(r, self.cap) if r > 0 else self.cap
+            self.rate = r
+            return r
+
+
+_GOV = None
+
+
+def _install_gov():
+    global _GOV
+    if ROLE != "web":
+        return
+    v = (os.environ.get("STREAM_GOV") or "").strip().lower()
+    if v in ("0", "off", "no", "false") or (not _LOW and v not in ("1", "on", "yes", "true")):
+        return
+    target = float(os.environ.get("CPU_STREAM_MAX") or (CPU_TARGET * 0.85))
+    _GOV = _StreamGov(target, _env_int("GOV_MIN_KBPS", 400) * 1024, _env_int("BW_MAX_KBPS", 0) * 1024)
+    print("[gov] stream CPU governor ON: CPU target %.1f%% (30 s and 3 min average), lowest speed %d KB/s%s" % (
+        target, _GOV.MIN // 1024, (", fixed cap %d KB/s" % (_GOV.cap // 1024)) if _GOV.cap else ""), flush=True)
+
+    def _loop():
+        last = None
+        while True:
+            time.sleep(3)
+            try:
+                g = _GOV
+                r = g.step(time.monotonic(), time.process_time())
+                state = int(r // 1024) if r > 0 else 0
+                if last is None or (state == 0) != (last == 0) or (state and last and abs(state - last) > 0.3 * last):
+                    print("[gov] cpu30=%.0f%% cpu3min=%.0f%% -> video speed limit: %s" % (
+                        g.a30, g.a180, ("%d KB/s total" % state) if state else "none"), flush=True)
+                    last = state
+            except Exception as e:
+                print("[gov] error:", repr(e)[:120], flush=True)
+    threading.Thread(target=_loop, daemon=True, name="stream-gov").start()
+
+
 def _bg_wait(limit=600):
     """Background loops call this between jobs: it waits while the app is using too much CPU."""
     t0 = time.time()
@@ -5924,6 +6141,8 @@ def main():
         print("[home] disk load failed:", repr(e)[:120], flush=True)
     port = int(sys.argv[1]) if len(sys.argv) > 1 else PORT
     _install_rpc()
+    _install_meter()
+    _install_gov()
     if ROLE == "worker":
         threading.Thread(target=_startup, daemon=True).start()
         srv = ThreadingHTTPServer(("0.0.0.0", port), _WorkerHandler)
