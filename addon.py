@@ -40,6 +40,39 @@ IDS
 
 Run:  python3 addon.py [port]     (binds 0.0.0.0)
 """
+
+# ---- .env file: used when the host panel does NOT pass its Variables to the process ----------------------
+# Make a file called  .env  next to addon.py (on Wispbyte: File Manager -> New file).  One  NAME=value  per line,
+# e.g. SQL_URL=...  TOKEN_SECRET=...  ADMIN_KEY=...  Real env variables always win.  Keep this file OUT of git
+# (it holds secrets) - git pull never touches a file that is not in the repo.
+def _load_dotenv():
+    import os as _os
+    here = _os.path.dirname(_os.path.abspath(__file__))
+    got = []
+    for fp in (_os.path.join(here, ".env"), _os.path.join(here, "env.txt"), "/home/container/.env"):
+        try:
+            with open(fp, encoding="utf-8-sig") as fh:
+                for ln in fh:
+                    ln = ln.strip()
+                    if not ln or ln.startswith("#") or "=" not in ln:
+                        continue
+                    k, v = ln.split("=", 1)
+                    k, v = k.strip(), v.strip()
+                    if k.lower().startswith("export "):
+                        k = k[7:].strip()
+                    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                        v = v[1:-1]
+                    if k and not _os.environ.get(k):
+                        _os.environ[k] = v
+                        got.append(k)
+        except OSError:
+            pass
+    if got:
+        print("[env] loaded from .env file: " + ", ".join(sorted(set(got))), flush=True)
+
+
+_load_dotenv()
+
 import base64
 import difflib
 import zlib
